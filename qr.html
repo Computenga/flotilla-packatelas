@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Etiquetas QR · Flotilla</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; color: #17202b; }
+    .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+    button { padding: 10px 16px; border-radius: 10px; border: 0; background: #1f3a5f; color: #fff; font-weight: 600; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(6cm, 1fr)); gap: 8mm; }
+    .label { border: 1px dashed #999; border-radius: 6px; padding: 5mm; text-align: center; break-inside: avoid; }
+    .label .qr { display: flex; justify-content: center; margin-bottom: 3mm; }
+    .label strong { font-size: 20pt; display: block; }
+    .label span { font-size: 10pt; color: #555; }
+    @media print { .bar { display: none; } body { margin: 0; } }
+  </style>
+</head>
+<body>
+  <div class="bar"><button onclick="print()">Imprimir</button><span id="msg">Cargando motos…</span></div>
+  <div class="grid" id="grid"></div>
+  <script type="module">
+    import { api } from './js/api.js';
+    import { CONFIG } from './js/config.js';
+    const msg = document.getElementById('msg');
+    try {
+      const list = await api('vehiculos');
+      msg.textContent = list.length + ' etiquetas. Pégalas en un lugar visible de cada moto.';
+      for (const v of list) {
+        const qr = document.createElement('div'); qr.className = 'qr';
+        const el = document.createElement('div'); el.className = 'label';
+        const t = document.createElement('strong'); t.textContent = v.vehiculo_id;
+        const s = document.createElement('span'); s.textContent = [v.placa, v.marca, v.modelo].filter(Boolean).join(' · ');
+        el.append(qr, t, s);
+        document.getElementById('grid').append(el);
+        new QRCode(qr, { text: CONFIG.QR_PREFIX + v.vehiculo_id, width: 170, height: 170, correctLevel: QRCode.CorrectLevel.M });
+      }
+    } catch (e) {
+      msg.textContent = 'Error: ' + e.message + ' (inicia sesión como admin en la app primero)';
+    }
+  </script>
+</body>
+</html>
