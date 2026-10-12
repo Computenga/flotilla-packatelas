@@ -2,7 +2,7 @@
 // la seguridad la hace Apps Script validando el token de sesión en cada llamada.
 export const CONFIG = {
   // URL del Web App de Apps Script (termina en /exec). Se llena al desplegar el script.
-  API_URL: 'PENDIENTE_URL_APPS_SCRIPT',
+  API_URL: 'https://script.google.com/macros/s/AKfycbxG483KPkUhdWk9npDFm3gq_7kupxP5oz6e6NkkgDVBymi6sXsJVj6RfOPUql-kQW1o1A/exec',
 
   firebase: {
     apiKey: 'AIzaSyAsfJqMplaZtDDEX_rBIwNsU6eTfd2cks4',
