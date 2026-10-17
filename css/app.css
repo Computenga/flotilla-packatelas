@@ -207,3 +207,7 @@ tr:last-child td { border-bottom: 0; }
 .spinner.sm { width: 20px; height: 20px; border-width: 3px; margin: 0; }
 .boot { min-height: 100vh; display: grid; place-items: center; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* Dentro del portal (iframe): sin márgenes de barra de estado */
+html.embed .topbar { padding-top: 10px; }
+html.embed .logo { display: none; }

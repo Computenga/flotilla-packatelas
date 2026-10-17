@@ -113,6 +113,7 @@ async function login() {
       const r = await busy('Entrando…', () => api('login', { usuario_id: sel.value, pin }));
       session.set(r.token, r.usuario);
       localStorage.setItem('fl_last_user', sel.value);
+      if (r.cambiar_pin) return cambiarPinView(pin, true);
       start();
     } catch (e) { pin = ''; draw(); toast(e.message, 'error'); }
   };
@@ -183,6 +184,7 @@ function pendingBanner(pend) {
 }
 
 function pushCard() {
+  if (EMBED) return null; // dentro del portal, los avisos los maneja el portal
   const st = pushState();
   if (st === 'granted' || st === 'no_soportado') return null;
   return h('div', { class: 'card soft' },
@@ -677,7 +679,8 @@ async function cuenta() {
       h('h2', { class: 'section' }, 'Administración'),
       h('a', { class: 'btn block', href: 'qr.html', target: '_blank' }, '🏷️ Imprimir etiquetas QR de motos'),
       h('div', { id: 'usuarios' }, h('div', { class: 'spinner' }))),
-    h('button', { class: 'btn danger-o block', onclick: () => { session.clear(); location.reload(); } }, 'Cerrar sesión'),
+    !session.viaPortal && h('button', { class: 'btn block', onclick: () => cambiarPinView() }, '🔑 Cambiar mi PIN'),
+    !EMBED && h('button', { class: 'btn danger-o block', onclick: () => { session.clear(); location.reload(); } }, 'Cerrar sesión'),
     h('p', { class: 'muted small center' }, 'Flotilla Packatelas · v' + (window.APP_VERSION || '1')));
   screen(role() === 'admin' ? 'Más' : 'Cuenta', body);
   if (role() === 'admin') usuariosAdmin(document.getElementById('usuarios'));
@@ -706,14 +709,89 @@ async function usuariosAdmin(box) {
   } catch (e) { fill(box, h('p', { class: 'error' }, e.message)); }
 }
 
+// ═════════ Cambio de PIN ═════════
+function cambiarPinView(actualConocido, obligatorio) {
+  const actual = h('input', { class: 'input big', type: 'password', inputmode: 'numeric', maxlength: 8, placeholder: 'PIN actual' });
+  const nuevo = h('input', { class: 'input big', type: 'password', inputmode: 'numeric', maxlength: 8, placeholder: 'PIN nuevo (4 a 8 dígitos)' });
+  const otra = h('input', { class: 'input big', type: 'password', inputmode: 'numeric', maxlength: 8, placeholder: 'Repite el PIN nuevo' });
+  if (actualConocido) actual.value = actualConocido;
+  const send = async () => {
+    if (nuevo.value !== otra.value) return toast('Los PIN nuevos no coinciden', 'warn');
+    try {
+      await busy('Guardando…', () => api('cambiarPin', { actual: actual.value, nuevo: nuevo.value }));
+      toast('PIN actualizado', 'ok');
+      start();
+    } catch (e) { toast(e.message, 'error', 5000); }
+  };
+  const body = h('div', {},
+    obligatorio && h('div', { class: 'banner info' }, 'Estás usando el PIN temporal. Crea uno propio para continuar; no lo compartas con nadie.'),
+    !actualConocido && [h('label', { class: 'label' }, 'PIN actual'), actual],
+    h('label', { class: 'label' }, 'PIN nuevo'), nuevo, otra,
+    h('button', { class: 'btn primary block', onclick: send }, 'Guardar PIN'),
+    obligatorio && h('button', { class: 'btn block', onclick: () => { session.clear(); location.reload(); } }, 'Salir'));
+  screen(obligatorio ? 'Crea tu PIN' : 'Cambiar PIN', body, obligatorio ? {} : { back: cuenta });
+  if (obligatorio) document.querySelector('.tabbar')?.remove();
+}
+
 // ═════════ Arranque ═════════
-function start() {
+// Integración con el portal: ambas apps viven en computenga.github.io y comparten el almacenamiento
+// del navegador. Si hay sesión del portal, se usa para entrar a la flotilla sin pedir PIN.
+const EMBED = new URLSearchParams(location.search).has('embed');
+if (EMBED) document.documentElement.classList.add('embed');
+
+function sesionPortal() {
+  try {
+    const token = localStorage.getItem('pp_token');
+    const user = JSON.parse(localStorage.getItem('pp_user') || 'null');
+    return token && user && user.no_empleado ? { token, id: 'U-' + user.no_empleado } : null;
+  } catch { return null; }
+}
+
+async function entrarConPortal(p) {
+  const box = h('div', { class: 'boot' }, h('div', {}, h('div', { class: 'spinner' }), h('p', { class: 'muted center' }, 'Entrando con tu sesión del portal…')));
+  $app.replaceChildren(box);
+  try {
+    const r = await api('ssoPortal', { portal_token: p.token });
+    session.set(r.token, r.usuario);
+    localStorage.setItem('fl_via_portal', '1');
+    return true;
+  } catch (e) {
+    if (EMBED) {
+      fill(box, h('div', { class: 'card', style: 'max-width:420px;margin:40px auto' }, h('h3', {}, '🛵 Flotilla'), h('p', {}, e.message)));
+      return null;
+    }
+    toast(e.message, 'warn', 5000);
+    return false;
+  }
+}
+
+/** Accesos directos desde el portal: #check, #carga, #ruta, #fallas, #documentos, #dashboard, #historial, #cuenta */
+function abrirDestino(hash) {
+  const d = String(hash || '').replace('#', '');
+  if (!d) return false;
+  history.replaceState(null, '', location.pathname + location.search);
+  const acciones = { check: checkMatutino, carga: cargaGasolina, ruta: antesRuta };
+  if (acciones[d]) { jornada().then(() => acciones[d]()); return true; }
+  if (['fallas', 'documentos', 'dashboard', 'historial', 'cuenta', 'jornada'].includes(d)) { go(d); return true; }
+  return false;
+}
+
+async function start() {
+  const portal = sesionPortal();
+  // Si el portal tiene a otra persona, la sesión de flotilla guardada ya no corresponde.
+  if (portal && session.user && session.user.usuario_id !== portal.id && localStorage.getItem('fl_via_portal')) session.clear();
+  if ((!session.token || !session.user) && portal) {
+    const ok = await entrarConPortal(portal);
+    if (ok === null) return;
+  }
   if (!session.token || !session.user) return login();
   state.tab = TABS[role()]?.[0]?.[0] || 'jornada';
-  go(state.tab);
+  if (!abrirDestino(location.hash)) go(state.tab);
   flushQueue().then(left => { if (left === 0) window.dispatchEvent(new CustomEvent('queue-change')); });
-  refreshPush(n => toast(`🔔 ${n.title || ''}${n.body ? ' — ' + n.body : ''}`, 'info', 6000));
+  // Dentro del portal, los avisos los recibe el portal (mismo Firebase); no se registra otro token aquí.
+  if (!EMBED) refreshPush(n => toast(`🔔 ${n.title || ''}${n.body ? ' — ' + n.body : ''}`, 'info', 6000));
 }
+window.addEventListener('hashchange', () => { if (session.token) abrirDestino(location.hash); });
 
 window.addEventListener('online', () => flushQueue().then(left => { toast(left ? 'Reconectado, enviando…' : 'Envíos pendientes completados', 'ok'); if (['jornada', 'cuenta'].includes(state.tab)) go(state.tab); }));
 

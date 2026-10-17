@@ -51,6 +51,8 @@ const ACTIONS = {
   // Sesión
   usuariosLogin:   { public: true, fn: usuariosLogin_ },
   login:           { public: true, fn: login_ },
+  ssoPortal:       { public: true, fn: ssoPortal_ },
+  cambiarPin:      { roles: ALL, fn: cambiarPin_ },
   me:              { roles: ALL, fn: (req, u) => u },
   registerDevice:  { roles: ALL, fn: registerDevice_ },
 
@@ -101,11 +103,84 @@ function login_(req) {
     Utilities.sleep(800);
     throw new Error('Usuario o PIN incorrecto');
   }
+  bitacora_(u.usuario_id, 'login', 'Usuarios', u.usuario_id, '');
+  return sesion_(u, { cambiar_pin: u.pin_temporal === 'SI' });
+}
+
+function sesion_(u, extra) {
   const exp = Date.now() + TOKEN_DAYS * 864e5;
   const payload = [u.usuario_id, u.rol, exp].join('|');
   const token = Utilities.base64EncodeWebSafe(payload) + '.' + sign_(payload);
-  bitacora_(u.usuario_id, 'login', 'Usuarios', u.usuario_id, '');
-  return { token: token, usuario: { usuario_id: u.usuario_id, nombre: u.nombre, rol: u.rol } };
+  return Object.assign({ token: token, usuario: { usuario_id: u.usuario_id, nombre: u.nombre, rol: u.rol } }, extra || {});
+}
+
+/**
+ * Entrada desde el portal: la flotilla y el portal viven en computenga.github.io, así que la app
+ * de flotilla puede leer la sesión del portal. Aquí se valida ese token con el propio API del portal
+ * (acción "yo") y, si es válido, se abre sesión de flotilla para U-[no_empleado] sin pedir PIN.
+ */
+function ssoPortal_(req) {
+  if (!req.portal_token) throw new Error('Falta la sesión del portal');
+  let r;
+  try {
+    const res = UrlFetchApp.fetch(config_('PORTAL_API_URL', PORTAL_API_DEFAULT), {
+      method: 'post', contentType: 'text/plain;charset=utf-8', muteHttpExceptions: true,
+      payload: JSON.stringify({ action: 'yo', token: req.portal_token }),
+    });
+    r = JSON.parse(res.getContentText());
+  } catch (e) { throw new Error('No se pudo validar la sesión del portal'); }
+  if (!r || !r.ok || !r.data || !r.data.no_empleado) throw new Error('Tu sesión del portal no es válida; vuelve a entrar al portal');
+  const id = 'U-' + String(r.data.no_empleado).trim();
+  const u = rows_('Usuarios').find(x => x.usuario_id === id);
+  if (!u || u.activo !== 'SI') throw new Error('No tienes acceso a la flotilla. Pide al administrador que te dé de alta.');
+  bitacora_(u.usuario_id, 'login_portal', 'Usuarios', u.usuario_id, '');
+  return sesion_(u, { via: 'portal' });
+}
+
+const PIN_GENERICO = '1234';
+
+function validarPinNuevo_(pin) {
+  pin = String(pin || '');
+  if (!/^\d{4,8}$/.test(pin)) throw new Error('El PIN debe tener de 4 a 8 dígitos');
+  if (pin === PIN_GENERICO || /^(\d)\1+$/.test(pin) || '0123456789'.indexOf(pin) >= 0 || '9876543210'.indexOf(pin) >= 0) {
+    throw new Error('Ese PIN es muy fácil de adivinar, elige otro');
+  }
+}
+
+function cambiarPin_(req, user) {
+  return withLock_(() => {
+    const u = rows_('Usuarios').find(x => x.usuario_id === user.usuario_id);
+    if (!u.pin_hash || hashPin_(pinSalt_(u), String(req.actual || '')) !== u.pin_hash) throw new Error('Tu PIN actual no es correcto');
+    validarPinNuevo_(req.nuevo);
+    ensureColumn_('Usuarios', 'pin_salt');
+    ensureColumn_('Usuarios', 'pin_temporal');
+    update_('Usuarios', u._row, { pin_hash: hashPin_(u.usuario_id, String(req.nuevo)), pin_salt: '', pin_temporal: 'NO' });
+    bitacora_(u.usuario_id, 'cambiar_pin', 'Usuarios', u.usuario_id, '');
+    return true;
+  });
+}
+
+/**
+ * Da el PIN genérico 1234 (temporal: se pide cambiarlo al entrar) a todo usuario activo sin PIN,
+ * y marca como temporal a quien todavía tenga 1234. Corre en cada sincronización con Personal.
+ */
+function asignarPinGenerico() {
+  ensureColumn_('Usuarios', 'pin_salt');
+  ensureColumn_('Usuarios', 'pin_temporal');
+  const res = { asignados: [], marcados: [] };
+  rows_('Usuarios').forEach(u => {
+    if (u.activo !== 'SI') return;
+    if (!u.pin_hash) {
+      update_('Usuarios', u._row, { pin_hash: hashPin_(u.usuario_id, PIN_GENERICO), pin_salt: '', pin_temporal: 'SI' });
+      res.asignados.push(u.usuario_id);
+    } else if (u.pin_temporal !== 'SI' && hashPin_(pinSalt_(u), PIN_GENERICO) === u.pin_hash) {
+      update_('Usuarios', u._row, { pin_temporal: 'SI' });
+      res.marcados.push(u.usuario_id);
+    }
+  });
+  if (res.asignados.length || res.marcados.length) bitacora_('sistema', 'pin_generico', 'Usuarios', '', JSON.stringify(res));
+  console.log(JSON.stringify(res));
+  return res;
 }
 
 function auth_(token, roles) {
@@ -150,7 +225,9 @@ function setPin_(usuarioId, pin) {
   const u = rows_('Usuarios').find(x => x.usuario_id === usuarioId);
   if (!u) throw new Error('Usuario no encontrado: ' + usuarioId);
   ensureColumn_('Usuarios', 'pin_salt');
-  update_('Usuarios', u._row, { pin_hash: hashPin_(usuarioId, String(pin)), pin_salt: '' });
+  ensureColumn_('Usuarios', 'pin_temporal');
+  // Un PIN que asigna el admin es temporal: el usuario debe cambiarlo en su primer ingreso.
+  update_('Usuarios', u._row, { pin_hash: hashPin_(usuarioId, String(pin)), pin_salt: '', pin_temporal: 'SI' });
 }
 
 /** Ejecutar desde el editor para asignar el primer PIN (por ejemplo, al admin). */
@@ -602,6 +679,7 @@ function instalarTriggers() {
 // es la misma persona en checador, portal, nómina y flotilla.
 
 const PERSONAL_SHEET_DEFAULT = '1U6RRubCwjpfmOilWSWRY1txh7dwP9d7SdAxXWmpxsf0';
+const PORTAL_API_DEFAULT = 'https://script.google.com/macros/s/AKfycbwsnN_EPOAiUuYJdlJSz1NeiKGZuKGq0YKiEeYzdqa_EDy6ik_5xKDxv1paaI1w67Ij/exec';
 const EMPLEADO_ID = /^U-\d+$/;
 
 /** Columnas de cada pestaña que guardan un usuario_id. */
@@ -763,8 +841,10 @@ function sincronizarPersonal() {
         res.altas.push(id + ' ' + p.nombre);
       }
     });
+    const pines = asignarPinGenerico();
+    res.pin_generico = pines.asignados;
     if (res.altas.length) {
-      notifyRole_(A, 'Nuevos repartidores en flotilla', res.altas.join(', ') + '. Asígnales PIN en Más → Usuarios y PIN.', 'alta_usuario', '');
+      notifyRole_(A, 'Nuevos repartidores en flotilla', res.altas.join(', ') + '. Entran desde el portal o con PIN 1234 (se les pide cambiarlo).', 'alta_usuario', '');
     }
     if (res.altas.length || res.bajas.length) bitacora_('sistema', 'sync_personal', 'Usuarios', '', JSON.stringify(res));
     return res;
@@ -835,12 +915,15 @@ function notifyRole_(roles, title, body, tipo, ref) {
 
 function notifyUser_(usuarioId, title, body, tipo, ref, emailFallback) {
   const devices = rows_('Dispositivos').filter(d => d.usuario_id === usuarioId && d.activo === 'SI');
+  const tokens = devices.map(d => String(d.fcm_token));
+  // Mismo proyecto de Firebase que el portal: también se avisa a los teléfonos registrados ahí.
+  dispositivosPortal_(usuarioId).forEach(t => { if (tokens.indexOf(t) < 0) { tokens.push(t); devices.push({ fcm_token: t, portal: true }); } });
   let sent = false;
   devices.forEach(d => {
-    const res = sendPush_(d.fcm_token, title, body, { tipo: tipo, ref: String(ref || '') });
+    const res = sendPush_(d.fcm_token, title, body, { tipo: tipo, ref: String(ref || ''), origen: 'flotilla' });
     log_(usuarioId, 'push', tipo, ref, title + ' — ' + body, res.ok ? 'enviado' : 'fallido');
     if (res.ok) sent = true;
-    if (res.unregistered) update_('Dispositivos', d._row, { activo: 'NO' });
+    if (res.unregistered && !d.portal) update_('Dispositivos', d._row, { activo: 'NO' });
   });
   if (!sent && emailFallback) {
     const u = rows_('Usuarios').find(x => x.usuario_id === usuarioId);
@@ -852,6 +935,22 @@ function notifyUser_(usuarioId, title, body, tipo, ref, emailFallback) {
 }
 
 /** FCM HTTP v1 con el token OAuth del propio script (el proyecto de Apps Script debe estar ligado al proyecto de GCP de Firebase). */
+/** Tokens de push activos del empleado en el portal (pestaña Dispositivos de la lista maestra). */
+function dispositivosPortal_(usuarioId) {
+  const m = String(usuarioId).match(/^U-(\d+)$/);
+  if (!m) return [];
+  if (!_cache.dispPortal) {
+    try {
+      const sh = SpreadsheetApp.openById(config_('PERSONAL_SHEET_ID', PERSONAL_SHEET_DEFAULT)).getSheetByName('Dispositivos');
+      const v = sh ? sh.getDataRange().getValues() : [[]];
+      const h = v.shift().map(String);
+      const iNo = h.indexOf('no_empleado'), iTok = h.indexOf('fcm_token'), iAct = h.indexOf('activo');
+      _cache.dispPortal = v.filter(r => String(r[iAct]) === 'SI' && r[iTok]).map(r => ({ no: String(r[iNo]).trim(), token: String(r[iTok]) }));
+    } catch (e) { console.warn('dispositivos portal', e); _cache.dispPortal = []; }
+  }
+  return _cache.dispPortal.filter(d => d.no === m[1]).map(d => d.token);
+}
+
 function sendPush_(token, title, body, data) {
   try {
     const res = UrlFetchApp.fetch('https://fcm.googleapis.com/v1/projects/' + FCM_PROJECT + '/messages:send', {

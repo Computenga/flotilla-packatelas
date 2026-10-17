@@ -6,7 +6,8 @@ export const session = {
   get token() { return localStorage.getItem('fl_token'); },
   get user() { try { return JSON.parse(localStorage.getItem('fl_user')); } catch { return null; } },
   set(token, user) { localStorage.setItem('fl_token', token); localStorage.setItem('fl_user', JSON.stringify(user)); },
-  clear() { localStorage.removeItem('fl_token'); localStorage.removeItem('fl_user'); },
+  get viaPortal() { return localStorage.getItem('fl_via_portal') === '1'; },
+  clear() { localStorage.removeItem('fl_token'); localStorage.removeItem('fl_user'); localStorage.removeItem('fl_via_portal'); },
 };
 
 export class NetworkError extends Error {}

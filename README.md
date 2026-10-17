@@ -12,6 +12,15 @@ Sin servidor propio:
 | Fotos y evidencias | Google Drive, carpeta "Flotilla Packatelas App" |
 | Notificaciones push | Firebase Cloud Messaging, proyecto `flotilla-packatelas` |
 
+## Usuarios, PIN y portal
+
+- **ID de usuario = `U-` + número de empleado** (el del ZKTeco y del portal). La pestaña *Usuarios* se sincroniza sola cada 6 h con la pestaña *Personal* de la lista maestra ("checador packatelas"): altas de repartidores, nombres y bajas. El rol de mecánico o admin se cambia a mano en *Usuarios*.
+- **PIN genérico 1234:** quien no tiene PIN (y cada alta nueva) recibe 1234 como PIN temporal; al entrar con él, la app obliga a crear uno propio. Un PIN que asigna el admin también es temporal.
+- **Entrada desde el portal:** el portal (`computenga.github.io/portal-packatelas`) y la flotilla comparten el almacenamiento del navegador. Si hay sesión del portal, la flotilla la valida con el API del portal (acción `yo`) y entra sin PIN. En el portal: tarjeta **"Mi moto hoy"** en Inicio y **Más → Flotilla**, que abre esta app dentro del portal (`?embed=1`).
+- **Accesos directos:** `#check`, `#carga`, `#ruta` (daño antes de ruta), `#fallas`, `#documentos`, `#dashboard`, `#historial`, `#cuenta`.
+- **Avisos:** además de los teléfonos registrados en la flotilla, se mandan a los registrados en el portal (mismo proyecto de Firebase).
+- **Cargos por mal uso:** el portal los toma de *Reparaciones* por `U-[número]` y los descuenta en la prenómina.
+
 ## Roles
 
 - **Repartidor**: check matutino (4 fotos, odómetro, km, fallas), carga de gasolina ligada a ese check, reporte opcional antes de ruta, historial de sus fallas y cargos.
