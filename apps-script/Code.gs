@@ -618,7 +618,8 @@ function personal_() {
   const values = sh.getDataRange().getValues();
   const h = values.shift().map(String);
   return values.map(r => { const o = {}; h.forEach((k, i) => o[k] = r[i]); return o; })
-    .filter(p => String(p.no_empleado).trim() !== '' && String(p.nombre).trim() !== '')
+    // Ignora renglones sin número o con un número tipo teléfono (registros duplicados por error de captura).
+    .filter(p => /^\d{1,6}$/.test(String(p.no_empleado).trim()) && String(p.nombre).trim() !== '')
     .map(p => Object.assign(p, { no_empleado: String(p.no_empleado).trim(), nombre: String(p.nombre).trim() }));
 }
 
