@@ -1,5 +1,5 @@
 // Service worker: caché de la app para abrir sin señal + notificaciones push de Firebase.
-const VERSION = 'flotilla-v1.0.0';
+const VERSION = 'flotilla-v1.1.0';
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/app.js', './js/api.js', './js/media.js', './js/config.js',

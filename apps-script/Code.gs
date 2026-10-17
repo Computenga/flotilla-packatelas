@@ -83,6 +83,7 @@ const ACTIONS = {
   dashboard:       { roles: [M, A], fn: dashboard_ },
   usuarios:        { roles: [A], fn: () => rows_('Usuarios').map(u => ({ usuario_id: u.usuario_id, nombre: u.nombre, rol: u.rol, correo: u.correo, telefono: u.telefono, activo: u.activo, tiene_pin: !!u.pin_hash })) },
   setPin:          { roles: [A], fn: (req) => { setPin_(req.usuario_id, req.pin); return true; } },
+  sincronizarPersonal: { roles: [A], fn: () => sincronizarPersonal() },
 };
 
 // ───────────────────────── Sesión y seguridad ─────────────────────────
@@ -96,7 +97,7 @@ function usuariosLogin_() {
 
 function login_(req) {
   const u = rows_('Usuarios').find(x => x.usuario_id === req.usuario_id && x.activo === 'SI');
-  if (!u || !u.pin_hash || hashPin_(u.usuario_id, String(req.pin || '')) !== u.pin_hash) {
+  if (!u || !u.pin_hash || hashPin_(pinSalt_(u), String(req.pin || '')) !== u.pin_hash) {
     Utilities.sleep(800);
     throw new Error('Usuario o PIN incorrecto');
   }
@@ -112,8 +113,10 @@ function auth_(token, roles) {
   const parts = String(token).split('.');
   const payload = Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[0])).getDataAsString();
   if (sign_(payload) !== parts[1]) throw new Error('Sesión inválida');
-  const [usuario_id, rol, exp] = payload.split('|');
+  const [tokenId, rol, exp] = payload.split('|');
   if (Date.now() > Number(exp)) throw new Error('Sesión expirada');
+  // Sesiones abiertas antes de la migración de IDs siguen funcionando: se traduce el ID viejo al nuevo.
+  const usuario_id = idMap_()[tokenId] || tokenId;
   const u = rows_('Usuarios').find(x => x.usuario_id === usuario_id);
   if (!u || u.activo !== 'SI') throw new Error('Usuario inactivo');
   if (roles && roles.indexOf(u.rol) < 0) throw new Error('Sin permiso para esta acción');
@@ -131,6 +134,12 @@ function sign_(payload) {
   return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(payload, secret_('TOKEN_SECRET')));
 }
 
+/** El PIN se cifra con una "sal" fija por usuario. Tras migrar IDs, pin_salt guarda el ID original
+ *  para que los PIN existentes sigan funcionando sin volver a asignarlos. */
+function pinSalt_(u) {
+  return u.pin_salt ? String(u.pin_salt) : String(u.usuario_id);
+}
+
 function hashPin_(usuarioId, pin) {
   const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, usuarioId + ':' + pin + ':' + secret_('PIN_PEPPER'));
   return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
@@ -140,12 +149,13 @@ function setPin_(usuarioId, pin) {
   if (!/^\d{4,8}$/.test(String(pin))) throw new Error('El PIN debe tener de 4 a 8 dígitos');
   const u = rows_('Usuarios').find(x => x.usuario_id === usuarioId);
   if (!u) throw new Error('Usuario no encontrado: ' + usuarioId);
-  update_('Usuarios', u._row, { pin_hash: hashPin_(usuarioId, String(pin)) });
+  ensureColumn_('Usuarios', 'pin_salt');
+  update_('Usuarios', u._row, { pin_hash: hashPin_(usuarioId, String(pin)), pin_salt: '' });
 }
 
 /** Ejecutar desde el editor para asignar el primer PIN (por ejemplo, al admin). */
 function asignarPinManual() {
-  setPin_('U-001', '1234'); // ← cambia el usuario y el PIN antes de ejecutar
+  setPin_('U-1', '1234'); // ← cambia el usuario (U-número de empleado) y el PIN antes de ejecutar
 }
 
 function registerDevice_(req, u) {
@@ -582,6 +592,182 @@ function instalarTriggers() {
   ScriptApp.newTrigger('tareaPendientesCarga').timeBased().everyDays(1).atHour(Number(String(config_('HORA_LIMITE_CHECK', '10:00')).split(':')[0])).inTimezone(TZ).create();
   ScriptApp.newTrigger('tareaFallasSinAtender').timeBased().everyHours(2).create();
   ScriptApp.newTrigger('tareaResumenSemanal').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8).inTimezone(TZ).create();
+  ScriptApp.newTrigger('sincronizarPersonal').timeBased().everyHours(6).create();
+}
+
+// ───────────────────────── Personal (lista maestra) ─────────────────────────
+//
+// La lista maestra de empleados es la pestaña "Personal" del archivo del checador.
+// En la flotilla, usuario_id = "U-" + no_empleado (el ID del ZKTeco), así un repartidor
+// es la misma persona en checador, portal, nómina y flotilla.
+
+const PERSONAL_SHEET_DEFAULT = '1U6RRubCwjpfmOilWSWRY1txh7dwP9d7SdAxXWmpxsf0';
+const EMPLEADO_ID = /^U-\d+$/;
+
+/** Columnas de cada pestaña que guardan un usuario_id. */
+const USER_ID_COLUMNS = {
+  Usuarios: ['usuario_id'], Checks: ['usuario_id'], Combustible: ['usuario_id'],
+  Fallas: ['reportada_por', 'responsable_id'], Reparaciones: ['mecanico_id', 'responsable_id'],
+  Documentos: ['actualizado_por'], Dispositivos: ['usuario_id'], Notificaciones: ['usuario_id'], Bitacora: ['usuario_id'],
+};
+
+function personal_() {
+  const ss = SpreadsheetApp.openById(config_('PERSONAL_SHEET_ID', PERSONAL_SHEET_DEFAULT));
+  const sh = ss.getSheetByName('Personal');
+  if (!sh) throw new Error('No encuentro la pestaña Personal en la lista maestra');
+  const values = sh.getDataRange().getValues();
+  const h = values.shift().map(String);
+  return values.map(r => { const o = {}; h.forEach((k, i) => o[k] = r[i]); return o; })
+    .filter(p => String(p.no_empleado).trim() !== '' && String(p.nombre).trim() !== '')
+    .map(p => Object.assign(p, { no_empleado: String(p.no_empleado).trim(), nombre: String(p.nombre).trim() }));
+}
+
+function esRepartidor_(p) {
+  return [p.rol, p.onb_rol, p.puesto].some(v => /repartid/i.test(String(v || '')));
+}
+
+function idMap_() {
+  if (_cache.idMap) return _cache.idMap;
+  try { _cache.idMap = JSON.parse(PropertiesService.getScriptProperties().getProperty('ID_MAP') || '{}'); }
+  catch (e) { _cache.idMap = {}; }
+  return _cache.idMap;
+}
+
+function ensureColumn_(name, col) {
+  const sh = sheet_(name);
+  const h = headers_(name);
+  if (h.indexOf(col) >= 0) return;
+  sh.getRange(1, h.length + 1).setValue(col).setFontWeight('bold').setFontColor('#ffffff').setBackground('#1f3a5f');
+  delete _cache['h:' + name];
+  delete _cache['r:' + name];
+}
+
+const norm_ = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+
+/**
+ * PASO 1 (no cambia nada): cruza Usuarios con Personal por nombre y escribe la propuesta
+ * en la pestaña MapeoIDs para revisarla. Se puede editar a mano la columna no_empleado y aplicar.
+ */
+function prepararMigracion() {
+  const personal = personal_();
+  const usuarios = rows_('Usuarios').filter(u => !EMPLEADO_ID.test(String(u.usuario_id)) || /^U-0\d/.test(String(u.usuario_id)));
+  const out = [['usuario_actual', 'nombre_flotilla', 'no_empleado', 'nombre_personal', 'nuevo_id', 'coincidencia', 'aplicar']];
+  usuarios.forEach(u => {
+    const t = norm_(u.nombre);
+    const cands = personal.map(p => {
+      const pt = norm_(p.nombre);
+      const hits = t.filter(x => pt.indexOf(x) >= 0).length;
+      return { p: p, score: t.length ? hits / t.length : 0, exact: pt.join(' ') === t.join(' ') };
+    }).filter(c => c.score > 0).sort((a, b) => b.score - a.score || (b.exact - a.exact));
+    const full = cands.filter(c => c.score === 1);
+    let best = null, tipo = 'sin coincidencia';
+    if (full.length === 1) { best = full[0]; tipo = best.exact ? 'exacta' : 'probable'; }
+    else if (full.length > 1) {
+      const ex = full.filter(c => c.exact);
+      if (ex.length === 1) { best = ex[0]; tipo = 'exacta'; }
+      else { best = full[0]; tipo = 'ambigua: ' + full.map(c => c.p.no_empleado + ' ' + c.p.nombre).join(' | '); }
+    } else if (cands.length) { best = cands[0]; tipo = 'parcial (revisar)'; }
+    const no = best ? best.p.no_empleado : '';
+    out.push([u.usuario_id, u.nombre, no, best ? best.p.nombre : '', no ? 'U-' + no : '', tipo,
+      (tipo === 'exacta' || tipo === 'probable') ? 'SI' : 'NO']);
+  });
+  let sh = ss_().getSheetByName('MapeoIDs');
+  if (sh) sh.clear(); else sh = ss_().insertSheet('MapeoIDs');
+  sh.getRange(1, 1, out.length, out[0].length).setValues(out);
+  sh.getRange(1, 1, 1, out[0].length).setFontWeight('bold').setFontColor('#ffffff').setBackground('#1f3a5f');
+  sh.setFrozenRows(1);
+  sh.getRange(out.length + 2, 1).setValue('Revisa no_empleado y aplicar (SI/NO). Luego ejecuta aplicarMigracion() desde el editor.');
+  console.log(out.map(r => r.join(' · ')).join('\n'));
+  return out.length - 1;
+}
+
+/**
+ * PASO 2: aplica la pestaña MapeoIDs (filas con aplicar = SI). Cambia los IDs en todo el historial,
+ * conserva los PIN y deja un mapa para que las sesiones abiertas sigan funcionando.
+ */
+function aplicarMigracion() {
+  const sh = ss_().getSheetByName('MapeoIDs');
+  if (!sh) throw new Error('Primero ejecuta prepararMigracion()');
+  const rows = sh.getDataRange().getValues().slice(1).filter(r => String(r[6]).toUpperCase() === 'SI' && String(r[2]).trim() !== '');
+  const map = {};
+  rows.forEach(r => { map[String(r[0]).trim()] = 'U-' + String(r[2]).trim(); });
+  const nuevos = Object.values(map);
+  const dup = nuevos.filter((v, i) => nuevos.indexOf(v) !== i);
+  if (dup.length) throw new Error('Número de empleado repetido en MapeoIDs: ' + dup.join(', '));
+  const existentes = rows_('Usuarios').map(u => String(u.usuario_id)).filter(id => !map[id]);
+  const choque = nuevos.filter(v => existentes.indexOf(v) >= 0);
+  if (choque.length) throw new Error('Ya existe un usuario con ese ID: ' + choque.join(', '));
+
+  return withLock_(() => {
+    ensureColumn_('Usuarios', 'pin_salt');
+    // Conserva los PIN: la sal pasa a ser el ID original.
+    rows_('Usuarios').forEach(u => {
+      if (map[u.usuario_id] && u.pin_hash && !u.pin_salt) update_('Usuarios', u._row, { pin_salt: u.usuario_id });
+    });
+    let cambios = 0;
+    Object.keys(USER_ID_COLUMNS).forEach(name => {
+      const s = sheet_(name);
+      const last = s.getLastRow();
+      if (last < 2) return;
+      const h = headers_(name);
+      USER_ID_COLUMNS[name].forEach(col => {
+        const c = h.indexOf(col);
+        if (c < 0) return;
+        const rng = s.getRange(2, c + 1, last - 1, 1);
+        const vals = rng.getValues();
+        let changed = false;
+        vals.forEach(v => { const k = String(v[0]).trim(); if (map[k]) { v[0] = map[k]; changed = true; cambios++; } });
+        if (changed) rng.setValues(vals);
+      });
+      delete _cache['r:' + name];
+    });
+    const props = PropertiesService.getScriptProperties();
+    const prev = idMap_();
+    // Encadena migraciones anteriores (A→B y B→C quedan como A→C).
+    Object.keys(prev).forEach(k => { if (map[prev[k]]) prev[k] = map[prev[k]]; });
+    props.setProperty('ID_MAP', JSON.stringify(Object.assign(prev, map)));
+    delete _cache.idMap;
+    bitacora_('sistema', 'migracion_ids', 'Usuarios', '', Object.keys(map).length + ' usuarios, ' + cambios + ' celdas');
+    console.log('Migrados ' + Object.keys(map).length + ' usuarios, ' + cambios + ' celdas actualizadas');
+    return { usuarios: Object.keys(map).length, celdas: cambios };
+  });
+}
+
+/**
+ * Sincroniza Usuarios con Personal (cada 6 h y desde la app: Más → Sincronizar con Personal).
+ * - Altas: los repartidores de Personal que no existan se agregan como U-[no_empleado] (sin PIN).
+ * - Cambios: actualiza nombre, teléfono y correo vacíos.
+ * - Bajas: estatus distinto de "activo" en Personal → activo = NO en la flotilla
+ *   (un reingreso se reactiva a mano poniendo activo = SI).
+ * Nunca cambia el rol ni el PIN de un usuario existente.
+ */
+function sincronizarPersonal() {
+  const personal = personal_();
+  return withLock_(() => {
+    const usuarios = rows_('Usuarios');
+    const res = { altas: [], actualizados: 0, bajas: [] };
+    personal.forEach(p => {
+      const id = 'U-' + p.no_empleado;
+      const activo = String(p.estatus || '').toLowerCase() === 'activo';
+      const u = usuarios.find(x => x.usuario_id === id);
+      if (u) {
+        const upd = {};
+        if (p.nombre && p.nombre !== u.nombre) upd.nombre = p.nombre;
+        if (!u.telefono && p.telefono) upd.telefono = String(p.telefono);
+        if (!u.correo && p.correo) upd.correo = String(p.correo);
+        if (!activo && u.activo === 'SI') { upd.activo = 'NO'; res.bajas.push(p.nombre); }
+        if (Object.keys(upd).length) { update_('Usuarios', u._row, upd); res.actualizados++; }
+      } else if (activo && esRepartidor_(p)) {
+        append_('Usuarios', { usuario_id: id, nombre: p.nombre, rol: 'repartidor', telefono: p.telefono || '', correo: p.correo || '', activo: 'SI', fecha_alta: new Date() });
+        res.altas.push(id + ' ' + p.nombre);
+      }
+    });
+    if (res.altas.length) {
+      notifyRole_(A, 'Nuevos repartidores en flotilla', res.altas.join(', ') + '. Asígnales PIN en Más → Usuarios y PIN.', 'alta_usuario', '');
+    }
+    if (res.altas.length || res.bajas.length) bitacora_('sistema', 'sync_personal', 'Usuarios', '', JSON.stringify(res));
+    return res;
+  });
 }
 
 function tareaDocumentos() {
@@ -704,7 +890,7 @@ function log_(usuarioId, canal, tipo, ref, mensaje, estado) {
 
 /** Prueba manual desde el editor: manda un push a todos los dispositivos de un usuario. */
 function probarPush() {
-  notifyUser_('U-001', 'Prueba', 'Push de prueba de la flotilla', 'prueba', '', false); // ← cambia el usuario
+  notifyUser_('U-1', 'Prueba', 'Push de prueba de la flotilla', 'prueba', '', false); // ← cambia el usuario
 }
 
 // ───────────────────────── Acceso a hojas ─────────────────────────

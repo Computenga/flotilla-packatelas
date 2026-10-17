@@ -687,7 +687,14 @@ async function usuariosAdmin(box) {
   try {
     const list = await api('usuarios');
     fill(box, h('h3', { class: 'sub' }, 'Usuarios y PIN'),
-      h('p', { class: 'muted small' }, 'Altas y cambios de nombre o rol se hacen en la hoja (pestaña Usuarios).'),
+      h('p', { class: 'muted small' }, 'Los repartidores se dan de alta solos desde la lista de Personal (cada 6 h). El rol de mecánico o admin se cambia en la hoja (pestaña Usuarios).'),
+      h('button', { class: 'btn block', onclick: async () => {
+        try {
+          const r = await busy('Sincronizando con Personal…', () => api('sincronizarPersonal'));
+          toast(`Altas: ${r.altas.length} · Actualizados: ${r.actualizados} · Bajas: ${r.bajas.length}`, 'ok', 5000);
+          usuariosAdmin(box);
+        } catch (e) { toast(e.message, 'error'); }
+      } }, '🔄 Sincronizar con Personal'),
       list.map(u => {
         const pin = h('input', { class: 'input sm', type: 'password', inputmode: 'numeric', placeholder: 'Nuevo PIN', maxlength: 8 });
         return h('div', { class: 'card row between wrap' },
